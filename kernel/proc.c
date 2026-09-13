@@ -5,6 +5,8 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
+#include "pstat.h"
+
 
 struct cpu cpus[NCPU];
 
@@ -417,6 +419,77 @@ kwait(uint64 addr)
     acquire(&wait_lock);
   }
 }
+
+int
+wait2(uint64 addr, uint64 rusage_addr)
+{
+  struct proc *pp;
+  int havekids, pid;
+  struct proc *p = myproc();
+
+  acquire(&wait_lock);
+
+  for(;;){
+    // Scan through table looking for exited children.
+    havekids = 0;
+    for(pp = proc; pp < &proc[NPROC]; pp++){
+      if(pp->parent == p){
+        // Make sure the child isn't still in exit() or swtch().
+        acquire(&pp->lock);
+
+        havekids = 1;
+        if(pp->state == ZOMBIE){
+          // Found one.
+          pid = pp->pid;
+
+          // Copy child's exit status.
+          if(addr != 0 &&
+             copyout(p->pagetable, p->sz, addr,
+                     (char *)&pp->xstate,
+                     sizeof(pp->xstate)) < 0){
+            release(&pp->lock);
+            release(&wait_lock);
+            return -1;
+          }
+
+          // Copy child's CPU time.
+          if(rusage_addr != 0){
+            struct rusage ru;
+            ru.cputime = pp->cputime;
+
+            if(copyout(p->pagetable, p->sz, rusage_addr,
+                       (char *)&ru, sizeof(ru)) < 0){
+              release(&pp->lock);
+              release(&wait_lock);
+              return -1;
+            }
+          }
+
+          pp->parent = 0;
+          freeproc(pp);
+          release(&pp->lock);
+          release(&wait_lock);
+          return pid;
+        }
+
+        release(&pp->lock);
+      }
+    }
+
+    // No point waiting if we don't have any children.
+    if(!havekids || killed(p)){
+      release(&wait_lock);
+      return -1;
+    }
+
+    // Wait for a child to exit.
+    sleep_prepare(p); //DOC: wait-sleep
+    release(&wait_lock);
+    sleep();
+    acquire(&wait_lock);
+  }
+}
+
 
 // Per-CPU process scheduler.
 // Each CPU calls scheduler() after setting itself up.
