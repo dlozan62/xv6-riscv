@@ -47,6 +47,30 @@ sys_wait2(void)
 }
 
 uint64
+sys_getprocs(void)
+{
+  uint64 addr;
+
+  argaddr(0, &addr);
+  return getprocs(addr);
+}
+
+uint64
+sys_getpriority(void)
+{
+  return getpriority();
+}
+
+uint64
+sys_setpriority(void)
+{
+  int priority;
+
+  argint(0, &priority);
+  return setpriority(priority);
+}
+
+uint64
 sys_sbrk(void)
 {
   uint64 addr;
@@ -120,3 +144,4 @@ sys_uptime(void)
   release(&tickslock);
   return xticks;
 }
+

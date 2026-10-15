@@ -149,6 +149,10 @@ UPROGS=\
         $U/_sleep\
         $U/_matmul\
         $U/_uptime\
+        $U/_ps\
+        $U/_prioritytest\
+        $U/_agingtest\
+        $U/_pexec\
         $U/_time1\
         $U/_time\
 	$U/_logstress\

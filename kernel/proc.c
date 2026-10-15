@@ -7,7 +7,6 @@
 #include "defs.h"
 #include "pstat.h"
 
-
 struct cpu cpus[NCPU];
 
 struct proc proc[NPROC];
@@ -27,6 +26,22 @@ extern char trampoline[]; // trampoline.S
 // memory model when using p->parent.
 // must be acquired before any p->lock.
 struct spinlock wait_lock;
+
+
+extern struct spinlock tickslock;
+extern uint ticks;
+
+static uint
+getticks(void)
+{
+  uint t;
+
+  acquire(&tickslock);
+  t = ticks;
+  release(&tickslock);
+
+  return t;
+}
 
 // Allocate a page for each process's kernel stack.
 // Map it high in memory, followed by an invalid
@@ -126,6 +141,8 @@ allocproc(void)
 found:
   p->pid = allocpid();
   p->state = USED;
+  p->priority = 0;
+  p->readytime = 0;
   p->cputime = 0;
   // Allocate a trapframe page.
   if ((p->trapframe = (struct trapframe *)kalloc()) == 0) {
@@ -227,6 +244,7 @@ userinit(void)
 
   p->cwd = namei("/");
 
+  p->readytime = getticks();
   p->state = RUNNABLE;
 
   release(&p->lock);
@@ -283,6 +301,9 @@ kfork(void)
   // Cause fork to return 0 in the child.
   np->trapframe->a0 = 0;
 
+  // Inherit the parent's priority.
+  np->priority = p->priority;
+
   // increment reference counts on open file descriptors.
   for (i = 0; i < NOFILE; i++)
     if (p->ofile[i])
@@ -300,6 +321,7 @@ kfork(void)
   release(&wait_lock);
 
   acquire(&np->lock);
+  np->readytime = getticks();
   np->state = RUNNABLE;
   release(&np->lock);
 
@@ -498,6 +520,8 @@ wait2(uint64 addr, uint64 rusage_addr)
 //  - swtch to start running that process.
 //  - eventually that process transfers control
 //    via swtch back to the scheduler.
+
+
 void
 scheduler(void)
 {
@@ -506,37 +530,72 @@ scheduler(void)
 
   c->proc = 0;
   for (;;) {
-    // The most recent process to run may have had interrupts
-    // turned off; enable them to avoid a deadlock if all
-    // processes are waiting. Then turn them back off
-    // to avoid a possible race between an interrupt
-    // and wfi.
     intr_on();
     intr_off();
 
     int found = 0;
+
+#if PRIORITY_SCHEDULER
+    // Find the runnable process with the highest effective priority
+    struct proc *best = 0;
+    int best_eff_priority = -1;
+    uint currtime = getticks();
+
     for (p = proc; p < &proc[NPROC]; p++) {
       acquire(&p->lock);
+
       if (p->state == RUNNABLE) {
-        // Switch to chosen process.  It is the process's job
-        // to release its lock and then reacquire it
-        // before jumping back to us.
+        int effective_priority =
+          p->priority + (currtime - p->readytime);
+
+        if (effective_priority > MAXEFFPRIORITY)
+          effective_priority = MAXEFFPRIORITY;
+
+        if (effective_priority > best_eff_priority) {
+          best_eff_priority = effective_priority;
+          best = p;
+        }
+      }
+
+      release(&p->lock);
+    }
+
+    if (best != 0) {
+      acquire(&best->lock);
+
+      if (best->state == RUNNABLE) {
+        best->state = RUNNING;
+        c->proc = best;
+        swtch(&c->context, &best->context);
+
+        mycpu()->intena = 0;
+        c->proc = 0;
+        found = 1;
+      }
+
+      release(&best->lock);
+    }
+
+#else
+    // Original round-robin scheduler.
+    for (p = proc; p < &proc[NPROC]; p++) {
+      acquire(&p->lock);
+
+      if (p->state == RUNNABLE) {
         p->state = RUNNING;
         c->proc = p;
         swtch(&c->context, &p->context);
 
-        // Don't re-enable interrupts on release.
         mycpu()->intena = 0;
-
-        // Process is done running for now.
-        // It should have changed its p->state before coming back.
         c->proc = 0;
         found = 1;
       }
+
       release(&p->lock);
     }
+#endif
+
     if (found == 0) {
-      // nothing to run; stop running on this core until an interrupt.
       asm volatile("wfi");
     }
   }
@@ -575,6 +634,7 @@ yield(void)
 {
   struct proc *p = myproc();
   acquire(&p->lock);
+  p->readytime = getticks();
   p->state = RUNNABLE;
   sched();
   release(&p->lock);
@@ -661,6 +721,7 @@ wakeup(void *chan)
       // If this waiting process has gotten so far as to actually
       // go to sleep, also set it back to RUNNING.
       if (p->state == SLEEPING) {
+        p->readytime = ticks;
         p->state = RUNNABLE;
       }
     }
@@ -682,6 +743,7 @@ kkill(int pid)
       p->killed = 1;
       if (p->state == SLEEPING) {
         // Wake process from sleep().
+        p->readytime = getticks();
         p->state = RUNNABLE;
       }
       release(&p->lock);
@@ -771,4 +833,69 @@ procdump(void)
     printk("%d %s %s", p->pid, state, p->name);
     printk("\n");
   }
+}
+
+
+int
+getprocs(uint64 addr)
+{
+  struct proc *p;
+  struct pstat ps;
+  struct proc *curproc = myproc();
+  int nprocs = 0;
+
+  for (p = proc; p < &proc[NPROC]; p++) {
+    acquire(&p->lock);
+
+    if (p->state != UNUSED) {
+      ps.pid = p->pid;
+      ps.state = p->state;
+      ps.priority = p->priority;
+      ps.readytime = p->readytime;
+      ps.size = p->sz;
+      ps.ppid = (p->parent != 0) ? p->parent->pid : 0;
+      safestrcpy(ps.name, p->name, sizeof(ps.name));
+
+      if (copyout(curproc->pagetable, curproc->sz,
+                  addr + nprocs * sizeof(struct pstat),
+                  (char *)&ps, sizeof(struct pstat)) < 0) {
+        release(&p->lock);
+        return -1;
+      }
+
+      nprocs++;
+    }
+
+    release(&p->lock);
+  }
+
+  return nprocs;
+}
+
+int
+getpriority(void)
+{
+  struct proc *p = myproc();
+  int priority;
+
+  acquire(&p->lock);
+  priority = p->priority;
+  release(&p->lock);
+
+  return priority;
+}
+
+int
+setpriority(int priority)
+{
+  struct proc *p = myproc();
+
+  if (priority < 0 || priority > 49)
+    return -1;
+
+  acquire(&p->lock);
+  p->priority = priority;
+  release(&p->lock);
+
+  return 0;
 }
